@@ -4,6 +4,7 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "userprog/process.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -84,11 +85,9 @@ kill (struct intr_frame *f)
   switch (f->cs)
     {
     case SEL_UCSEG:
-      /* User's code segment, so it's a user exception, as we
-         expected.  Kill the user process.  */
-      printf ("%s: dying due to interrupt %#04x (%s).\n",
-              thread_name (), f->vec_no, intr_name (f->vec_no));
-      intr_dump_frame (f);
+      /* User's code segment: terminate process with status -1 without debug dump */
+      if (thread_current ()->sync_node != NULL)
+        thread_current ()->sync_node->exit_code = -1;
       thread_exit (); 
 
     case SEL_KCSEG:
@@ -148,9 +147,13 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
+  /* If page fault occurred in user mode, terminate cleanly */
+  if (user || f->cs == SEL_UCSEG)
+    {
+      kill (f);
+      return;
+    }
+
   printf ("Page fault at %p: %s error %s page in %s context.\n",
           fault_addr,
           not_present ? "not present" : "rights violation",
