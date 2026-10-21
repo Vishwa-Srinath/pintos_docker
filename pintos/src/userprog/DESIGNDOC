@@ -17,10 +17,11 @@
 >> If you have any preliminary comments on your submission, notes for the
 >> TAs, or extra credit, please give them here.
 
-Implemented support for argument parsing, system calls (halt, exit, exec,
-wait, create, remove, open, filesize, read, write, seek, tell, close), safe
-user-memory validation, process hierarchy lifecycle management, file descriptor
-tables, synchronized filesystem access, and denying writes to running executables (ROX).
+Implemented argument parsing, user memory validation, system call dispatcher
+(13 system calls: halt, exit, exec, wait, create, remove, open, filesize,
+read, write, seek, tell, close), process hierarchy synchronization with semaphores,
+per-process file descriptors, thread-safe filesystem synchronization, and denying
+writes to running executables (ROX).
 
 >> Please cite any offline or online sources you consulted while
 >> preparing your submission, other than the Pintos documentation, course
@@ -39,13 +40,13 @@ None.
 
 In `userprog/process.c`:
 ```c
-struct spawn_payload 
+struct proc_aux 
   {
-    char *fn_copy;           /* Copy of command line string to be parsed */
-    struct proc_sync *sync;  /* Shared parent-child synchronization node */
+    char *fn_copy;               /* Copy of command line string */
+    struct child_entry *c_entry; /* Pointer to child tracking structure */
   };
 ```
-Transports command-line copy and process synchronization node to the newly spawned kernel thread.
+Used to bundle and transfer the command line copy and child tracking record to `start_process()`.
 
 ---- ALGORITHMS ----
 
@@ -53,55 +54,46 @@ Transports command-line copy and process synchronization node to the newly spawn
 >> you arrange for the elements of argv[] to be in the right order?
 >> How do you avoid overflowing the stack page?
 
-In `process_execute()`, the command line string is copied and the first token is
-extracted using `strtok_r()` to name the newly created thread.
+In `process_execute()`, the command line is copied and the first token is extracted
+using `strtok_r()` to name the kernel thread.
 
-In `load()`, after successfully establishing the stack frame in `setup_stack()`,
-we invoke `push_command_args()`:
-1. The command line is tokenized with `strtok_r()` into an array of string pointers
-   `argv[0 ... argc - 1]`.
-2. The actual string bytes (including terminating null bytes `\0`) are pushed
-   onto the user stack in reverse order (`argv[argc - 1]` down to `argv[0]`). Their
-   resulting virtual memory addresses on the stack are recorded in a temporary array.
-3. The stack pointer `%esp` is word-aligned to a 4-byte boundary:
+In `load()`, after setting up the initial stack page in `setup_stack()`, we invoke
+`setup_args()`:
+1. `strtok_r()` splits the command line into an array of string tokens `argv[0 ... argc - 1]`.
+2. The argument strings (with trailing `\0`) are pushed onto the user stack in reverse order
+   (`argv[argc - 1]` down to `argv[0]`), and their user virtual addresses are saved in an array.
+3. The stack pointer is rounded down to a multiple of 4 to satisfy 80x86 word-alignment:
    `*esp = (void *) ((uint8_t *) *esp - (((uintptr_t) *esp) % 4))`.
-4. A null pointer sentinel `argv[argc] = NULL` (4 bytes) is pushed onto the stack.
-5. The pointers to each argument string (`argv[argc - 1]` down to `argv[0]`) are
-   pushed onto the stack. This guarantees that `argv[0]` resides at the lowest
-   memory address, matching the standard C array convention where `argv[i] == *(argv + i)`.
-6. The pointer to `argv[0]` (`char **argv`) is pushed.
+4. A null pointer sentinel `argv[argc] = NULL` is pushed.
+5. The pointers to each argument string are pushed in reverse order (`argv[argc - 1]` down
+   to `argv[0]`). Since `argv[0]` is pushed last, it sits at the lowest address on the stack,
+   ensuring `argv[i]` corresponds to `*(argv + i)`.
+6. The address of `argv[0]` (`char **argv`) is pushed.
 7. The argument count `argc` (`int`) is pushed.
-8. A dummy return address (`void * 0`) is pushed to conform to standard 80x86 call frames.
+8. A dummy return address (`0`) is pushed to complete the stack frame.
 
-To avoid overflowing the stack page, before returning from `push_command_args()`,
-we calculate `((uint8_t *) PHYS_BASE - (uint8_t *) *esp)`. If the accumulated stack data
-exceeds `PGSIZE` (4096 bytes), the function returns `false`, causing `load()` to abort
-and cleanly fail.
+To prevent overflowing the 4 kB stack page, we check `((uint8_t *) PHYS_BASE - (uint8_t *) *esp) <= PGSIZE`.
+If the pushed data exceeds `PGSIZE`, `setup_args()` returns `false`, aborting the load.
 
 ---- RATIONALE ----
 
 >> A3: Why does Pintos implement strtok_r() but not strtok()?
 
-`strtok()` stores its internal parsing state in a static global pointer, making it
-non-reentrant and inherently unsafe in a multithreaded operating system kernel where
-multiple threads or interrupt contexts could invoke string parsing concurrently and
-corrupt each other's state. In contrast, `strtok_r()` is reentrant because the caller
-explicitly provides a pointer (`save_ptr`) to maintain parser context on the thread's
-own local execution stack.
+`strtok()` relies on an internal static buffer to remember its position between calls,
+making it unsafe in multithreaded systems where concurrent calls will overwrite each
+other's state. `strtok_r()` is reentrant because the caller passes a `save_ptr` pointer
+which keeps state locally on the caller's stack, avoiding concurrency bugs.
 
 >> A4: In Pintos, the kernel separates commands into a executable name
 >> and arguments.  In Unix-like systems, the shell does this
 >> separation.  Identify at least two advantages of the Unix approach.
 
-1. **Security & Principle of Least Privilege**: Parsing complex shell commands,
-   wildcard expansions (`*`), pipes (`|`), environment variable replacements, and
-   redirections in user space minimizes the kernel attack surface. If parsing logic
-   contains bugs or buffer overflows, only the unprivileged user shell is compromised
-   rather than ring 0 kernel space.
-2. **Efficiency & Kernel Simplicity**: The kernel remains lean and focused solely
-   on executing the requested binary (`execve`), delegating syntax validation, path
-   lookups, alias expansions, and argument splitting to user space before any expensive
-   context switch or system call occurs.
+1. **Security & Smaller Attack Surface**: Parsing complex command syntax, wildcards,
+   and redirections in user space prevents potential buffer overflows or parser bugs
+   from affecting privileged kernel code.
+2. **Efficiency & Modularity**: The kernel only needs a simple `execve` interface.
+   User space can validate input, expand environment variables, and manage aliases
+   before invoking any expensive system call.
 
                  SYSTEM CALLS
                  ============
@@ -116,79 +108,75 @@ In `userprog/process.h`:
 ```c
 typedef int pid_t;
 
-struct fd_entry 
+struct f_desc 
   {
-    int fd;                     /* Unique integer file descriptor ID */
-    struct file *file;          /* Underlying opened Pintos file struct */
-    struct list_elem elem;      /* List element in thread's open_files list */
+    int fd;                     /* Integer file descriptor */
+    struct file *fp;            /* Pointer to opened file */
+    struct list_elem elem;      /* List element for thread's fds list */
   };
 
-struct proc_sync 
+struct child_entry 
   {
-    tid_t tid;                  /* Process identifier */
-    int exit_code;              /* Process termination status */
-    bool load_status;           /* Binary loading outcome */
-    bool is_alive;              /* Status indicator of child process */
-    bool parent_alive;          /* Status indicator of parent process */
-    bool waited;                /* Wait-at-most-once indicator */
-    struct semaphore sema_load; /* Barrier for parent exec synchronization */
-    struct semaphore sema_wait; /* Barrier for parent wait synchronization */
-    struct lock sync_lock;      /* Guards mutual exclusion during cleanup */
-    struct list_elem elem;      /* List element in parent's child_list */
+    tid_t tid;                  /* Child thread ID */
+    int exit_status;            /* Exit code of child */
+    bool load_ok;               /* Whether binary loaded successfully */
+    bool is_alive;              /* True while child is still running */
+    bool parent_alive;          /* True while parent is still running */
+    bool waited;                /* True if wait() was already called on child */
+    struct semaphore s_load;    /* Signals when child finishes loading */
+    struct semaphore s_exit;    /* Signals when child exits */
+    struct lock lk;             /* Synchronizes status updates */
+    struct list_elem elem;      /* List element for parent's children list */
   };
 ```
 
-In `threads/thread.h` inside `struct thread`:
+In `threads/thread.h`:
 ```c
 #ifdef USERPROG
     uint32_t *pagedir;
-    struct proc_sync *sync_node;  /* Synchronization block shared with parent */
-    struct list child_list;       /* List of struct proc_sync for children */
-    struct list open_files;       /* List of struct fd_entry for opened files */
-    int next_fd;                  /* Monotonically increasing next FD index */
-    struct file *executable;      /* Running executable kept open for ROX */
+    struct child_entry *c_entry; /* Pointer to child tracking structure */
+    struct list children;        /* List of child processes */
+    struct list fds;             /* List of opened files */
+    int cur_fd;                  /* Next file descriptor number to allocate */
+    struct file *my_file;        /* Open executable binary to deny writes */
 #endif
 ```
 
 In `userprog/syscall.c`:
 ```c
-static struct lock filesys_lock;  /* Global lock protecting file system calls */
+static struct lock fs_lock;      /* Global filesystem synchronization lock */
 ```
 
 >> B2: Describe how file descriptors are associated with open files.
 >> Are file descriptors unique within the entire OS or just within a
 >> single process?
 
-File descriptors are associated with open files through `struct fd_entry` nodes,
-each holding an integer `fd` and a `struct file *`. These nodes are stored in the
-current thread's private `open_files` list (`thread_current()->open_files`).
+File descriptors are managed per-process via `struct f_desc`, which pairs an integer
+`fd` with a `struct file *`. Each thread holds an independent `fds` list.
 
-File descriptors are unique only within a single process. Each process maintains its
-own independent `open_files` list and its own `next_fd` counter (initialized to 2,
-leaving 0 for `STDIN_FILENO` and 1 for `STDOUT_FILENO`). Thus, two independent processes
-can have identical file descriptor integers referring to completely different open files.
+File descriptors are unique only within a single process. Each process allocates
+descriptors from its own `cur_fd` counter (starting at 2). Two different processes
+can have the same descriptor number referring to completely different files.
 
 ---- ALGORITHMS ----
 
 >> B3: Describe your code for reading and writing user data from the
 >> kernel.
 
-Before reading or writing user data, addresses are rigorously validated:
-1. `is_valid_user_ptr(uaddr)` verifies `uaddr != NULL`, `is_user_vaddr(uaddr)` (below
-   `PHYS_BASE`), and `pagedir_get_page(thread_current()->pagedir, uaddr) != NULL`.
-2. `is_valid_user_buffer(buffer, size)` verifies both `buffer` and `buffer + size - 1`
-   are below `PHYS_BASE`, and checks every page boundary in between using
-   `pagedir_get_page()`.
-3. For strings, `is_valid_user_str(ustr)` verifies every byte in the string up to the
-   null terminator `\0`.
+Before reading or writing data:
+1. `check_user_ptr(vaddr)` ensures `vaddr != NULL`, `is_user_vaddr(vaddr)` (below `PHYS_BASE`),
+   and `pagedir_get_page()` confirms the page is mapped.
+2. `check_user_buf(buf, sz)` checks both ends of the buffer and verifies all pages spanned
+   using `pagedir_get_page()`.
+3. `check_user_str(s)` checks every byte until `\0`.
 
-If any check fails, the process is terminated with exit code `-1`.
+If validation fails, `exit_proc(-1)` is called immediately.
 
 Once verified:
-- For `read`: if `fd == 0`, bytes are retrieved from the keyboard using `input_getc()`.
-  If `fd >= 2`, `file_read()` is invoked under `filesys_lock`.
-- For `write`: if `fd == 1`, bytes are output to the console using `putbuf()`.
-  If `fd >= 2`, `file_write()` is invoked under `filesys_lock`.
+- `read`: If `fd == 0`, reads keystrokes with `input_getc()`. If `fd >= 2`, acquires `fs_lock`
+  and calls `file_read()`.
+- `write`: If `fd == 1`, writes to console with `putbuf()`. If `fd >= 2`, acquires `fs_lock`
+  and calls `file_write()`.
 
 >> B4: Suppose a system call causes a full page (4,096 bytes) of data
 >> to be copied from user space into the kernel.  What is the least
@@ -197,39 +185,31 @@ Once verified:
 >> for a system call that only copies 2 bytes of data?  Is there room
 >> for improvement in these numbers, and how much?
 
-For a full page (4,096 bytes):
-- **Least inspections**: 1 inspection. If the buffer is perfectly page-aligned
-  (e.g., offset 0 within a page), all 4,096 bytes occupy exactly one physical page.
-- **Greatest inspections**: 2 inspections. If the buffer starts at any non-zero offset
-  (e.g., offset 1), the 4,096 bytes span across the boundary of two adjacent pages.
+For 4,096 bytes:
+- **Least**: 1 inspection if the buffer is page-aligned (offset 0), spanning exactly 1 page.
+- **Greatest**: 2 inspections if it starts at an offset > 0, spanning 2 adjacent pages.
 
-For 2 bytes of data:
-- **Least inspections**: 1 inspection, when both bytes reside on the same page.
-- **Greatest inspections**: 2 inspections, when the first byte is at offset 4,095
-  of a page and the second byte is at offset 0 of the subsequent page.
+For 2 bytes:
+- **Least**: 1 inspection if both bytes are on the same page.
+- **Greatest**: 2 inspections if the first byte is at offset 4095 and the second at offset 0 of next page.
 
 **Room for improvement**:
-Our page-stride algorithm inspects each unique page touched by the buffer exactly once.
-Because virtual memory translation is evaluated per page table entry, inspecting more
-than once per page is redundant. The theoretical lower bound is $\lceil \text{size} / \text{PGSIZE} \rceil$
-pages when aligned, which our code achieves. Further optimization could check page-directory
-pointer validity or cache the last-translated page frame number.
+Our page-stride algorithm checks each unique page touched once. Because virtual memory
+protection operates at page granularity, checking once per page is optimal.
 
 >> B5: Briefly describe your implementation of the "wait" system call
 >> and how it interacts with process termination.
 
 `wait(pid)` calls `process_wait(pid)`:
-1. The parent scans its `child_list` for a `struct proc_sync` matching `child_tid`.
-2. If no matching child is found, or if `sync->waited == true` (already waited on),
-   `process_wait()` immediately returns `-1`.
-3. The parent sets `sync->waited = true` and calls `sema_down(&sync->sema_wait)`.
-4. If the child is still executing, the parent blocks until the child exits.
-   If the child has already terminated, `sema_wait` was already incremented, so the
-   parent does not block.
-5. In `process_exit()`, the exiting child records its `exit_code`, sets `is_alive = false`,
-   and calls `sema_up(&sync->sema_wait)`.
-6. The parent unblocks, reads `sync->exit_code`, removes `sync` from `child_list`,
-   and frees the `struct proc_sync` memory.
+1. The parent scans its `children` list for a `child_entry` with matching `tid`.
+2. If not found or if `child->waited == true`, it returns `-1`.
+3. The parent sets `child->waited = true` and calls `sema_down(&child->s_exit)`.
+4. If the child is still running, the parent blocks until the child exits. If the child
+   already terminated, `s_exit` was already incremented, so the parent continues immediately.
+5. In `process_exit()`, the child sets its `exit_status`, marks `is_alive = false`,
+   and calls `sema_up(&child->s_exit)`.
+6. The parent unblocks, reads `child->exit_status`, removes `child` from `children`,
+   and frees the struct.
 
 >> B6: Any access to user program memory at a user-specified address
 >> can fail due to a bad pointer value.  Such accesses must cause the
@@ -245,29 +225,23 @@ pointer validity or cache the last-translated page frame number.
 >> paragraphs, describe the strategy or strategies you adopted for
 >> managing these issues.  Give an example.
 
-We solved this problem through upfront modular validation combined with a centralized
-termination handler `sys_terminate(int status)`.
+We solved this by verifying all pointers upfront before taking any action or acquiring
+resources, and centralizing process cleanup in `exit_proc(status)`.
 
-Rather than interleaving raw pointer dereferences with complex nested `if-else` blocks,
-every system call executes a strict validation sequence before touching data:
-1. `f->esp` is validated for `sizeof(int)`.
-2. Argument slots on the stack are validated for the expected argument count.
-3. User string or buffer pointers are validated across their entire extent before any
-   kernel locks are acquired or system resources are allocated.
+In the system call handler:
+1. `f->esp` is validated for `sizeof(int)` before reading the syscall number.
+2. Argument addresses on the stack (`&p[1]`, `&p[2]`, etc.) are checked before dereference.
+3. String and buffer pointers are validated across their entire length before `fs_lock` is acquired.
 
-If any validation step fails, `sys_terminate(-1)` is called immediately. To guarantee
-that temporary resources are never leaked upon abrupt termination, `sys_terminate()` checks
-`lock_held_by_current_thread(&filesys_lock)` and releases the lock if currently held, then
-invokes `thread_exit()`. `thread_exit()` calls `process_exit()`, which unconditionally
-closes all entries in `cur->open_files`, releases write locks and closes `cur->executable`,
-updates parent synchronization state, and destroys the page directory.
+If any check fails, `exit_proc(-1)` is called immediately. To prevent resource leaks:
+- `exit_proc()` checks if `fs_lock` is held by the current thread and releases it.
+- `thread_exit()` calls `process_exit()`, which closes all open file descriptors,
+  closes the executable binary (`my_file`), wakes up the waiting parent, and frees the page directory.
 
-For example, in `SYS_WRITE`, the syscall handler first verifies that the stack contains
-valid arguments for `fd`, `buffer`, and `size`. Next, `is_valid_user_buffer(buffer, size)`
-confirms that the entire user buffer is mapped below `PHYS_BASE`. Only after all checks
-succeed does the handler acquire `filesys_lock` and call `file_write()`. If the user provided
-an invalid buffer pointer (such as kernel memory or unmapped memory), `sys_terminate(-1)`
-is invoked before `filesys_lock` is ever acquired, preventing deadlocks or leaked handles.
+For example, in `SYS_WRITE`, the stack arguments `fd`, `buf`, and `len` are validated first.
+Then `check_user_buf(buf, len)` verifies the entire memory region. Only then is `fs_lock`
+acquired and `file_write()` executed. If `buf` is invalid, the process terminates before
+acquiring `fs_lock`, ensuring no lock leaks or corrupted state.
 
 ---- SYNCHRONIZATION ----
 
@@ -277,18 +251,16 @@ is invoked before `filesys_lock` is ever acquired, preventing deadlocks or leake
 >> success/failure status passed back to the thread that calls "exec"?
 
 In `process_execute()`:
-1. The parent allocates `struct proc_sync *child_sync` and initializes `sema_load` to 0.
-2. The parent creates the child thread passing `child_sync` within `struct spawn_payload`.
-3. The parent immediately executes `sema_down(&child_sync->sema_load)`, blocking until
-   the child finishes ELF binary loading.
-4. The child runs `start_process()` and calls `load()`.
-5. The child stores the boolean result in `sync->load_status = success`.
-6. If loading failed, the child clears its reference `cur->sync_node = NULL` and signals
-   `sema_up(&sync->sema_load)` before calling `thread_exit()`.
-7. If loading succeeded, the child signals `sema_up(&sync->sema_load)`.
-8. The parent unblocks. It inspects `child_sync->load_status`:
-   - If false: parent removes `child_sync` from `child_list`, frees it, and returns `-1`.
-   - If true: parent returns `child_sync->tid`.
+1. The parent allocates `struct child_entry *child`, initializes `s_load` to 0, and adds
+   it to `cur->children`.
+2. The parent creates the child thread and immediately calls `sema_down(&child->s_load)`,
+   blocking until the child finishes loading.
+3. The child runs `start_process()` and calls `load()`.
+4. If loading succeeds, `child->load_ok = true` and `sema_up(&child->s_load)`.
+5. If loading fails, `child->load_ok = false`, `cur->c_entry = NULL`, `sema_up(&child->s_load)`,
+   and the child calls `thread_exit()`.
+6. The parent unblocks. If `!child->load_ok`, parent removes `child` from `children`,
+   frees it, and returns `-1`. Otherwise, it returns `child->tid`.
 
 >> B8: Consider parent process P with child process C.  How do you
 >> ensure proper synchronization and avoid race conditions when P
@@ -297,61 +269,44 @@ In `process_execute()`:
 >> terminates without waiting, before C exits?  After C exits?  Are
 >> there any special cases?
 
-Synchronization is governed by `struct proc_sync`, protected by `sync_lock` and `sema_wait`:
+Synchronization is managed through `struct child_entry`, protected by `lk` and `s_exit`:
 
-- **P calls wait(C) before C exits**:
-  P calls `sema_down(&sync->sema_wait)` and sleeps. When C terminates, `process_exit()`
-  records `sync->exit_code`, calls `sema_up(&sync->sema_wait)`, and finishes. P wakes up,
-  retrieves `sync->exit_code`, removes `sync` from `P->child_list`, and frees `sync`.
-- **P calls wait(C) after C exits**:
-  C has already called `sema_up(&sync->sema_wait)` and exited. When P calls `wait(C)`,
-  `sema_down()` decrements the count without blocking. P immediately retrieves the exit
-  code and frees `sync`.
-- **P terminates without waiting, before C exits**:
-  In `process_exit()`, P walks `P->child_list`. Under `sync_lock`, P marks `sync->parent_alive = false`.
-  When C eventually terminates, C discovers `parent_alive == false` and frees `sync` itself.
-- **P terminates without waiting, after C exits**:
-  In `process_exit()`, P walks `P->child_list`. Because C has already exited (`is_alive == false`),
-  P frees `sync` directly.
-- **Special Cases**:
-  - Waiting on non-child PID or waiting twice: detected immediately via `child_list` search
-    and `sync->waited` flag, returning `-1` without blocking.
+- **P calls wait(C) before C exits**: P sleeps on `sema_down(&child->s_exit)`. When C exits,
+  `process_exit()` sets `exit_status`, signals `s_exit`, and terminates. P wakes up, reads
+  `exit_status`, removes `child` from its list, and frees it.
+- **P calls wait(C) after C exits**: C has already signaled `s_exit`. `sema_down()` succeeds
+  without blocking. P reads `exit_status` and frees `child`.
+- **P terminates without waiting, before C exits**: In `process_exit()`, P marks
+  `child->parent_alive = false` under `lk`. When C eventually terminates, C sees
+  `parent_alive == false` and frees `child` itself.
+- **P terminates without waiting, after C exits**: P sees `child->is_alive == false` and
+  frees `child` directly.
+- **Special Cases**: Calling `wait()` on a PID that is not a direct child or calling `wait()`
+  twice on the same child returns `-1` immediately.
 
 ---- RATIONALE ----
 
 >> B9: Why did you choose to implement access to user memory from the
 >> kernel in the way that you did?
 
-We selected upfront pointer verification (`pagedir_get_page()` and `is_user_vaddr()`)
-because:
-1. **Safety and Simplicity**: Verifying memory before dereferencing prevents page faults
-   from occurring in kernel mode, ensuring that kernel code never executes unexpected
-   traps during system calls.
-2. **Deterministic Resource Cleanliness**: Validating memory before acquiring locks
-   (e.g., `filesys_lock`) or allocating resources completely eliminates lock-leaks
-   and complex exception unwinding that would otherwise be required if a page fault
-   occurred midway through a filesystem transaction.
+We chose upfront pointer verification via `pagedir_get_page()` and `is_user_vaddr()` because:
+1. **Safety**: It avoids triggering unexpected kernel-mode page faults.
+2. **Resource Cleanliness**: Validating memory before acquiring locks or allocating heap
+   memory guarantees that we never leak kernel locks or memory on invalid user pointers.
 
 >> B10: What advantages or disadvantages can you see to your design
 >> for file descriptors?
 
 **Advantages**:
-- Independent, per-process namespaces: File descriptors are unique to each process,
-  preventing cross-process interference and matching standard POSIX semantics.
-- Dynamic allocation: Using a linked list of `struct fd_entry` avoids arbitrary fixed-size
-  limits (e.g. 16 or 64 files), supporting any number of open files bounded only by
-  available kernel heap memory.
+- Independent per-process namespaces: Matches POSIX semantics and prevents interference.
+- Dynamic size: Uses a linked list, avoiding arbitrary fixed array size limitations.
 
 **Disadvantages**:
-- Lookup overhead: Linear search $O(N)$ through `cur->open_files` is slightly slower than
-  a direct array indexing scheme $O(1)$. However, for typical process file descriptor
-  counts ($N < 128$), the overhead is negligible and the memory efficiency is superior.
+- Sequential $O(N)$ lookup instead of array indexing $O(1)$. However, for realistic file
+  counts ($N < 128$), the performance impact is negligible.
 
 >> B11: The default tid_t to pid_t mapping is the identity mapping.
 >> If you changed it, what advantages are there to your approach?
 
-We retained the identity mapping (`pid_t == tid_t`) because Pintos implements a strict
-1:1 threading model where each user process consists of exactly one kernel thread. An
-identity mapping avoids the overhead and complexity of maintaining a secondary PID-to-TID
-translation table while maintaining complete compatibility with the Pintos scheduler
-and process tracking infrastructure.
+We kept the identity mapping (`pid_t == tid_t`) because Pintos assigns one thread per
+process. This avoids the overhead and complexity of an additional translation layer.

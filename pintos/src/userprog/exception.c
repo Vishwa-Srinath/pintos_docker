@@ -86,8 +86,8 @@ kill (struct intr_frame *f)
     {
     case SEL_UCSEG:
       /* User's code segment: terminate process with status -1 without debug dump */
-      if (thread_current ()->sync_node != NULL)
-        thread_current ()->sync_node->exit_code = -1;
+      if (thread_current ()->c_entry != NULL)
+        thread_current ()->c_entry->exit_status = -1;
       thread_exit (); 
 
     case SEL_KCSEG:

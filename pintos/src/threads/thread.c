@@ -465,11 +465,11 @@ init_thread (struct thread *t, const char *name, int priority)
   t->magic = THREAD_MAGIC;
 
 #ifdef USERPROG
-  t->sync_node = NULL;
-  list_init (&t->child_list);
-  list_init (&t->open_files);
-  t->next_fd = 2;
-  t->executable = NULL;
+  t->c_entry = NULL;
+  list_init (&t->children);
+  list_init (&t->fds);
+  t->cur_fd = 2;
+  t->my_file = NULL;
 #endif
 
   old_level = intr_disable ();

@@ -6,28 +6,28 @@
 
 typedef int pid_t;
 
-/* Structure representing an open file descriptor for a user process. */
-struct fd_entry 
+/* file descriptor entry */
+struct f_desc 
   {
-    int fd;                     /* Integer descriptor visible to user program */
-    struct file *file;          /* Underlying Pintos file pointer */
-    struct list_elem elem;      /* Element in thread's open_files list */
+    int fd;
+    struct file *fp;
+    struct list_elem elem;
   };
 
-/* Shared control and synchronization block between parent and child processes. */
-struct proc_sync 
+/* tracking child process info and exit status */
+struct child_entry 
   {
-    tid_t tid;                  /* Process ID of the child */
-    int exit_code;              /* Terminating exit status code */
-    bool load_status;           /* True if binary loaded successfully */
-    bool is_alive;              /* True while child process continues running */
-    bool parent_alive;          /* True while parent process is still active */
-    bool waited;                /* True if parent has already called wait */
+    tid_t tid;
+    int exit_status;
+    bool load_ok;
+    bool is_alive;
+    bool parent_alive;
+    bool waited;
 
-    struct semaphore sema_load; /* Signaled after child attempts binary load */
-    struct semaphore sema_wait; /* Signaled when child terminates */
-    struct lock sync_lock;      /* Guards teardown and reference state */
-    struct list_elem elem;      /* Element in parent's child_list */
+    struct semaphore s_load;
+    struct semaphore s_exit;
+    struct lock lk;
+    struct list_elem elem;
   };
 
 tid_t process_execute (const char *file_name);
