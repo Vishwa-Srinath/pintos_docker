@@ -96,6 +96,11 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct proc_sync *sync_node;        /* Process synchronization block */
+    struct list child_list;             /* Children processes */
+    struct list open_files;             /* Open file descriptors */
+    int next_fd;                        /* Next available file descriptor number */
+    struct file *executable;            /* Running executable file to deny write */
 #endif
 
     /* Owned by thread.c. */
