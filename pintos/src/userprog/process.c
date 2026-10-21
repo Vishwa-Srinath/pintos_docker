@@ -350,7 +350,7 @@ setup_args (const char *cmd_line, void **esp)
 
   uintptr_t arg_addrs[128];
 
-  /* 1. push actual string chars in reverse order */
+  /* push string chars in reverse order */
   for (int i = argc - 1; i >= 0; i--)
     {
       size_t len = strlen (argv[i]) + 1;
@@ -359,7 +359,7 @@ setup_args (const char *cmd_line, void **esp)
       arg_addrs[i] = (uintptr_t) *esp;
     }
 
-  /* 2. word align stack pointer (4 bytes) */
+  /* 4-byte stack alignment */
   uintptr_t pad = ((uintptr_t) *esp) % 4;
   if (pad != 0)
     {
@@ -367,27 +367,27 @@ setup_args (const char *cmd_line, void **esp)
       memset (*esp, 0, pad);
     }
 
-  /* 3. push null sentinel for argv[argc] */
+  /* null sentinel */
   *esp = (void *) ((uint8_t *) *esp - sizeof (char *));
   *(char **) *esp = NULL;
 
-  /* 4. push string addresses */
+  /* push string pointers */
   for (int i = argc - 1; i >= 0; i--)
     {
       *esp = (void *) ((uint8_t *) *esp - sizeof (char *));
       *(char **) *esp = (char *) arg_addrs[i];
     }
 
-  /* 5. push argv pointer */
+  /* pointer to argv[0] */
   char **argv_head = (char **) *esp;
   *esp = (void *) ((uint8_t *) *esp - sizeof (char **));
   *(char ***) *esp = argv_head;
 
-  /* 6. push argc */
+  /* argc */
   *esp = (void *) ((uint8_t *) *esp - sizeof (int));
   *(int *) *esp = argc;
 
-  /* 7. push fake return address */
+  /* dummy return address */
   *esp = (void *) ((uint8_t *) *esp - sizeof (void *));
   *(void **) *esp = NULL;
 

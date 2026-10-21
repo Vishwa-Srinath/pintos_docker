@@ -14,7 +14,7 @@ struct f_desc
     struct list_elem elem;
   };
 
-/* tracking child process info and exit status */
+/* child process info */
 struct child_entry 
   {
     tid_t tid;

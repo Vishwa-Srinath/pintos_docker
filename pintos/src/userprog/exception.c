@@ -85,7 +85,7 @@ kill (struct intr_frame *f)
   switch (f->cs)
     {
     case SEL_UCSEG:
-      /* User's code segment: terminate process with status -1 without debug dump */
+      /* user exception: exit with -1 */
       if (thread_current ()->c_entry != NULL)
         thread_current ()->c_entry->exit_status = -1;
       thread_exit (); 
@@ -147,7 +147,7 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  /* If page fault occurred in user mode, terminate cleanly */
+  /* user fault */
   if (user || f->cs == SEL_UCSEG)
     {
       kill (f);

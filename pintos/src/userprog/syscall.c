@@ -30,7 +30,7 @@ unlock_fs (void)
 
 static void syscall_handler (struct intr_frame *);
 
-/* helper: check if user pointer is valid and mapped */
+/* check user pointer */
 static bool
 check_user_ptr (const void *vaddr)
 {
@@ -39,7 +39,7 @@ check_user_ptr (const void *vaddr)
   return pagedir_get_page (thread_current ()->pagedir, vaddr) != NULL;
 }
 
-/* helper: check buffer of size sz */
+/* check buffer */
 static bool
 check_user_buf (const void *buf, size_t sz)
 {
@@ -64,7 +64,7 @@ check_user_buf (const void *buf, size_t sz)
   return check_user_ptr (e);
 }
 
-/* helper: check null-terminated user string */
+/* check string */
 static bool
 check_user_str (const char *s)
 {
@@ -80,7 +80,7 @@ check_user_str (const char *s)
   return false;
 }
 
-/* helper to terminate process with exit code */
+/* exit process */
 static void
 exit_proc (int status)
 {
@@ -93,7 +93,7 @@ exit_proc (int status)
   thread_exit ();
 }
 
-/* helper: find opened file by fd */
+/* find fd */
 static struct f_desc *
 find_fd (int fd)
 {
@@ -118,7 +118,7 @@ syscall_init (void)
 static void
 syscall_handler (struct intr_frame *f) 
 {
-  /* make sure stack pointer is valid */
+  /* check esp */
   if (!check_user_buf (f->esp, sizeof (int)))
     exit_proc (-1);
 
